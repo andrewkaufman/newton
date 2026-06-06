@@ -393,6 +393,41 @@ def parse_usd(
             return collider.GetCollisionEnabledAttr().Get()
         return False
 
+    def _snap_xform(pos, rot, eps: float = 1e-12) -> tuple[wp.vec3, wp.quat]:
+        # Snap components whose magnitude is below ``eps`` to exact zero before
+        # building wp.transform, so two backends that produce mathematically-
+        # equivalent transforms with sub-ulp FP residuals serialize to identical
+        # f32 bytes (matching SHA hashes across nano vs pxr backends).
+        p = [0.0 if abs(float(v)) < eps else float(v) for v in pos]
+        q = [0.0 if abs(float(v)) < eps else float(v) for v in rot]
+        return wp.vec3(*p), wp.quat(*q)
+
+    def _canonicalize_visual_quat(rot) -> wp.quat:
+        # wp.transform_decompose's matrix-to-quat extraction picks a quat sign
+        # based on the largest diagonal of the rotation submatrix. When the
+        # pxr and nano backends produce rel_mat values that differ at sub-ulp
+        # FP level, this sign-pick can flip, producing q vs -q for the same
+        # rotation. Both quats represent the same physical rotation, but the
+        # serialized shape_transform bytes diverge, surfacing as max_abs_diff
+        # of 1.0/1.41 on 5 robots (anybotics_anymal_c, pal_tiago_dual,
+        # robotstudio_so101, tetheria_aero_hand_open, umi_gripper).
+        #
+        # Force a deterministic sign convention by negating the quat when the
+        # first significantly-nonzero component (in qx, qy, qz, qw order
+        # matching wp.quat layout) is negative. The threshold tolerates the
+        # sub-ulp residual drift so that backends differing only at FP-noise
+        # level agree on sign.
+        q = [float(v) for v in rot]
+        eps = 1e-6
+        anchor = 0.0
+        for v in q:
+            if abs(v) > eps:
+                anchor = v
+                break
+        if anchor < 0.0:
+            q = [-v for v in q]
+        return wp.quat(*q)
+
     def _xform_to_mat44(xform: wp.transform) -> wp.mat44:
         return wp.transform_compose(xform.p, xform.q, wp.vec3(1.0))
 
@@ -804,6 +839,8 @@ def parse_usd(
             rel_mat = prim_world_mat
 
         xform_pos, xform_rot, scale = wp.transform_decompose(rel_mat)
+        xform_pos, xform_rot = _snap_xform(xform_pos, xform_rot)
+        xform_rot = _canonicalize_visual_quat(xform_rot)
         xform = wp.transform(xform_pos, xform_rot)
 
         if prim.IsInstance():
@@ -1033,7 +1070,8 @@ def parse_usd(
             return -1
 
         rot = rigid_body_desc.rotation
-        origin = wp.transform(rigid_body_desc.position, usd.value_to_warp(rot))
+        _orig_pos, _orig_rot = _snap_xform(rigid_body_desc.position, usd.value_to_warp(rot))
+        origin = wp.transform(_orig_pos, _orig_rot)
         if incoming_xform is not None:
             origin = wp.mul(incoming_xform, origin)
         path = str(prim.GetPath())
@@ -1090,8 +1128,10 @@ def parse_usd(
     ):
         """Resolve the parent and child of a joint and return their parent + child transforms if requested."""
         if get_transforms:
-            parent_tf = wp.transform(joint_desc.localPose0Position, usd.value_to_warp(joint_desc.localPose0Orientation))
-            child_tf = wp.transform(joint_desc.localPose1Position, usd.value_to_warp(joint_desc.localPose1Orientation))
+            _p_pos, _p_rot = _snap_xform(joint_desc.localPose0Position, usd.value_to_warp(joint_desc.localPose0Orientation))
+            _c_pos, _c_rot = _snap_xform(joint_desc.localPose1Position, usd.value_to_warp(joint_desc.localPose1Orientation))
+            parent_tf = wp.transform(_p_pos, _p_rot)
+            child_tf = wp.transform(_c_pos, _c_rot)
         else:
             parent_tf = None
             child_tf = None
@@ -2830,7 +2870,8 @@ def parse_usd(
                 else:
                     shape_density = default_shape_density
                 prim_and_scene = (prim, physics_scene_prim)
-                local_xform = wp.transform(shape_spec.localPos, usd.value_to_warp(shape_spec.localRot))
+                _lx_pos, _lx_rot = _snap_xform(shape_spec.localPos, usd.value_to_warp(shape_spec.localRot))
+                local_xform = wp.transform(_lx_pos, _lx_rot)
                 if body_id == -1:
                     shape_xform = incoming_world_xform * local_xform
                 else:
