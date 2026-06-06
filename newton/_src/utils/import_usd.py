@@ -393,13 +393,19 @@ def parse_usd(
             return collider.GetCollisionEnabledAttr().Get()
         return False
 
-    def _snap_xform(pos, rot, eps: float = 1e-12) -> tuple[wp.vec3, wp.quat]:
-        # Snap components whose magnitude is below ``eps`` to exact zero before
-        # building wp.transform, so two backends that produce mathematically-
-        # equivalent transforms with sub-ulp FP residuals serialize to identical
-        # f32 bytes (matching SHA hashes across nano vs pxr backends).
+    def _snap_xform(pos, rot, eps: float = 1e-12, eps_rot: float | None = None) -> tuple[wp.vec3, wp.quat]:
+        # Snap components whose magnitude is below ``eps`` (pos) / ``eps_rot``
+        # (quat) to exact zero before building wp.transform, so two backends
+        # that produce mathematically-equivalent transforms with sub-ulp FP
+        # residuals serialize to identical f32 bytes (matching SHA hashes
+        # across nano vs pxr backends). ``eps_rot`` defaults to ``eps``; pass
+        # a larger value at call sites where the rotation is composed across
+        # multiple multiplications (e.g. body origin × incoming articulation
+        # xform), since f32 mul-then-add accumulates dust just above ``eps``.
+        if eps_rot is None:
+            eps_rot = eps
         p = [0.0 if abs(float(v)) < eps else float(v) for v in pos]
-        q = [0.0 if abs(float(v)) < eps else float(v) for v in rot]
+        q = [0.0 if abs(float(v)) < eps_rot else float(v) for v in rot]
         return wp.vec3(*p), wp.quat(*q)
 
     def _canonicalize_visual_quat(rot) -> wp.quat:
@@ -1077,7 +1083,13 @@ def parse_usd(
             return -1
 
         rot = rigid_body_desc.rotation
-        _orig_pos, _orig_rot = _snap_xform(rigid_body_desc.position, usd.value_to_warp(rot))
+        # ``eps_rot=1e-10`` snaps sub-ulp dust left by f32 transform
+        # composition (e.g. quat components at ~9e-12 from numpy@ vs pxr
+        # GfMatrix mul-add accumulation drift) so body_q bytes agree across
+        # backends. The default ``eps=1e-12`` would miss values just above
+        # 1e-12; tighter than 1e-7 to avoid perturbing the FP-amplifying mass
+        # cluster on robots like robotiq_2f85.
+        _orig_pos, _orig_rot = _snap_xform(rigid_body_desc.position, usd.value_to_warp(rot), eps_rot=1e-10)
         origin = wp.transform(_orig_pos, _orig_rot)
         if incoming_xform is not None:
             origin = wp.mul(incoming_xform, origin)
@@ -1086,7 +1098,7 @@ def parse_usd(
             # identity), and the two backends produce slightly different
             # residuals, surfacing as body_q hash mismatches. Re-snap so the
             # final f32 bytes agree.
-            _orig_pos, _orig_rot = _snap_xform(origin.p, origin.q)
+            _orig_pos, _orig_rot = _snap_xform(origin.p, origin.q, eps_rot=1e-10)
             origin = wp.transform(_orig_pos, _orig_rot)
         path = str(prim.GetPath())
 
