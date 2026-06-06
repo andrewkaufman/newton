@@ -268,7 +268,7 @@ def triangle_inertia(
 def compute_solid_mesh_inertia(
     indices: wp.array[int],
     vertices: wp.array[wp.vec3],
-    # outputs
+    # outputs (per-triangle, reduced deterministically on host)
     volume: wp.array[float],
     first: wp.array[wp.vec3],
     second: wp.array[wp.mat33],
@@ -279,9 +279,9 @@ def compute_solid_mesh_inertia(
     r = vertices[indices[i * 3 + 2]]
 
     v, f, s = triangle_inertia(p, q, r)
-    wp.atomic_add(volume, 0, v)
-    wp.atomic_add(first, 0, f)
-    wp.atomic_add(second, 0, s)
+    volume[i] = v
+    first[i] = f
+    second[i] = s
 
 
 @wp.kernel
@@ -289,7 +289,7 @@ def compute_hollow_mesh_inertia(
     indices: wp.array[int],
     vertices: wp.array[wp.vec3],
     thickness: wp.array[float],
-    # outputs
+    # outputs (per-triangle, reduced deterministically on host)
     volume: wp.array[float],
     first: wp.array[wp.vec3],
     second: wp.array[wp.mat33],
@@ -316,7 +316,7 @@ def compute_hollow_mesh_inertia(
     vk0 = vk - tk
     vk1 = vk + tk
 
-    v_total = 0.0
+    v_total = float(0.0)
     f_total = wp.vec3(0.0)
     s_total = wp.mat33(0.0)
 
@@ -353,9 +353,9 @@ def compute_hollow_mesh_inertia(
     f_total += f
     s_total += s
 
-    wp.atomic_add(volume, 0, v_total)
-    wp.atomic_add(first, 0, f_total)
-    wp.atomic_add(second, 0, s_total)
+    volume[tid] = v_total
+    first[tid] = f_total
+    second[tid] = s_total
 
 
 def compute_inertia_mesh(
@@ -386,10 +386,12 @@ def compute_inertia_mesh(
     indices = np.array(indices).flatten()
     num_tris = len(indices) // 3
 
-    # Allocating for mass and inertia
-    com_warp = wp.zeros(1, dtype=wp.vec3)
-    I_warp = wp.zeros(1, dtype=wp.mat33)
-    vol_warp = wp.zeros(1, dtype=float)
+    # Per-triangle output buffers; reduce deterministically on the host in
+    # f64 so results are bit-identical across runs and across host-side
+    # callers (vs. wp.atomic_add, which has nondeterministic ordering on GPU).
+    vol_warp = wp.zeros(num_tris, dtype=float)
+    com_warp = wp.zeros(num_tris, dtype=wp.vec3)
+    I_warp = wp.zeros(num_tris, dtype=wp.mat33)
 
     wp_vertices = wp.array(vertices, dtype=wp.vec3)
     wp_indices = wp.array(indices, dtype=int)
@@ -426,9 +428,17 @@ def compute_inertia_mesh(
             ],
         )
 
-    V_tot = float(vol_warp.numpy()[0])  # signed volume
-    F_tot = com_warp.numpy()[0]  # first moment
-    S_tot = I_warp.numpy()[0]  # second moment
+    if num_tris == 0:
+        V_tot = 0.0
+        F_tot = np.zeros(3, dtype=np.float64)
+        S_tot = np.zeros((3, 3), dtype=np.float64)
+    else:
+        vols_np = vol_warp.numpy().astype(np.float64)
+        firsts_np = com_warp.numpy().astype(np.float64).reshape(num_tris, 3)
+        seconds_np = I_warp.numpy().astype(np.float64).reshape(num_tris, 3, 3)
+        V_tot = float(vols_np.sum())
+        F_tot = firsts_np.sum(axis=0)
+        S_tot = seconds_np.sum(axis=0)
 
     # If the winding is inward, flip signs
     if V_tot < 0:
