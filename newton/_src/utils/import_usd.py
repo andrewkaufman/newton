@@ -1081,6 +1081,13 @@ def parse_usd(
         origin = wp.transform(_orig_pos, _orig_rot)
         if incoming_xform is not None:
             origin = wp.mul(incoming_xform, origin)
+            # wp.mul of two snapped transforms can leave sub-ulp residuals in
+            # the result (e.g. ~1e-17 components in a quat that should be
+            # identity), and the two backends produce slightly different
+            # residuals, surfacing as body_q hash mismatches. Re-snap so the
+            # final f32 bytes agree.
+            _orig_pos, _orig_rot = _snap_xform(origin.p, origin.q)
+            origin = wp.transform(_orig_pos, _orig_rot)
         path = str(prim.GetPath())
 
         body_armature_source_path: str | None = None
