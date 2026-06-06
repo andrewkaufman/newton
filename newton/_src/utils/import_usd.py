@@ -1796,7 +1796,9 @@ def parse_usd(
                 axis_unit = [0.0, 0.0, 0.0]
                 axis_unit[axis_idx] = 1.0
                 rotated = wp.quat_rotate(relative_q, wp.vec3(axis_unit[0], axis_unit[1], axis_unit[2]))
-                dof_axis = (float(rotated[0]), float(rotated[1]), float(rotated[2]))
+                # Snap sub-ulp residue from f32 quat_rotate so backends with
+                # 1-ulp localPose0Orientation drift land on identical axis values.
+                dof_axis = tuple(0.0 if abs(float(rotated[k])) < 1e-6 else float(rotated[k]) for k in range(3))
 
             ax = ModelBuilder.JointDofConfig(
                 axis=dof_axis,
