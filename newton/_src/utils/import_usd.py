@@ -417,15 +417,22 @@ def parse_usd(
         # matching wp.quat layout) is negative. The threshold tolerates the
         # sub-ulp residual drift so that backends differing only at FP-noise
         # level agree on sign.
-        q = [float(v) for v in rot]
         eps = 1e-6
+        # Snap sub-ulp f32 residuals (near-identity-rotation noise like
+        # 1.6e-9 in a quat component) to exact zero so the two backends'
+        # f32 bytes agree even when their residuals differ by a single ulp.
+        q = [(0.0 if abs(float(v)) < eps else float(v)) for v in rot]
         anchor = 0.0
         for v in q:
             if abs(v) > eps:
                 anchor = v
                 break
         if anchor < 0.0:
-            q = [-v for v in q]
+            # ``-v if v else 0.0`` avoids producing -0.0 from negating an exact
+            # zero, so the f32 bytes match across backends even where one quat
+            # arrived as q and the other as -q (negating 0.0 in IEEE 754 gives
+            # -0.0, which serializes to different bytes than +0.0).
+            q = [(-v if v else 0.0) for v in q]
         return wp.quat(*q)
 
     def _xform_to_mat44(xform: wp.transform) -> wp.mat44:
@@ -2871,6 +2878,7 @@ def parse_usd(
                     shape_density = default_shape_density
                 prim_and_scene = (prim, physics_scene_prim)
                 _lx_pos, _lx_rot = _snap_xform(shape_spec.localPos, usd.value_to_warp(shape_spec.localRot))
+                _lx_rot = _canonicalize_visual_quat(_lx_rot)
                 local_xform = wp.transform(_lx_pos, _lx_rot)
                 if body_id == -1:
                     shape_xform = incoming_world_xform * local_xform
