@@ -393,7 +393,13 @@ def parse_usd(
             return collider.GetCollisionEnabledAttr().Get()
         return False
 
-    def _snap_xform(pos, rot, eps: float = 1e-12, eps_rot: float | None = None) -> tuple[wp.vec3, wp.quat]:
+    def _snap_xform(
+        pos,
+        rot,
+        eps: float = 1e-12,
+        eps_rot: float | None = None,
+        normalize_quat: bool = False,
+    ) -> tuple[wp.vec3, wp.quat]:
         # Snap components whose magnitude is below ``eps`` (pos) / ``eps_rot``
         # (quat) to exact zero before building wp.transform, so two backends
         # that produce mathematically-equivalent transforms with sub-ulp FP
@@ -402,10 +408,19 @@ def parse_usd(
         # a larger value at call sites where the rotation is composed across
         # multiple multiplications (e.g. body origin × incoming articulation
         # xform), since f32 mul-then-add accumulates dust just above ``eps``.
+        # ``normalize_quat`` re-rounds quat components through f64 unit-magnitude
+        # division so non-unit-quat magnitude drift between backends collapses
+        # to the same f32 components (clears 1-ulp drift on joint poses sourced
+        # from shim vs pxr GfMatrix3f extraction).
         if eps_rot is None:
             eps_rot = eps
         p = [0.0 if abs(float(v)) < eps else float(v) for v in pos]
         q = [0.0 if abs(float(v)) < eps_rot else float(v) for v in rot]
+        if normalize_quat:
+            mag2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]
+            if mag2 > 0.0:
+                inv_mag = 1.0 / math.sqrt(mag2)
+                q = [v * inv_mag for v in q]
         return wp.vec3(*p), wp.quat(*q)
 
     def _canonicalize_visual_quat(rot) -> wp.quat:
@@ -1154,8 +1169,16 @@ def parse_usd(
     ):
         """Resolve the parent and child of a joint and return their parent + child transforms if requested."""
         if get_transforms:
-            _p_pos, _p_rot = _snap_xform(joint_desc.localPose0Position, usd.value_to_warp(joint_desc.localPose0Orientation))
-            _c_pos, _c_rot = _snap_xform(joint_desc.localPose1Position, usd.value_to_warp(joint_desc.localPose1Orientation))
+            _p_pos, _p_rot = _snap_xform(
+                joint_desc.localPose0Position,
+                usd.value_to_warp(joint_desc.localPose0Orientation),
+                normalize_quat=True,
+            )
+            _c_pos, _c_rot = _snap_xform(
+                joint_desc.localPose1Position,
+                usd.value_to_warp(joint_desc.localPose1Orientation),
+                normalize_quat=True,
+            )
             parent_tf = wp.transform(_p_pos, _p_rot)
             child_tf = wp.transform(_c_pos, _c_rot)
         else:
@@ -1199,6 +1222,8 @@ def parse_usd(
 
         if incoming_xform is not None:
             parent_tf = incoming_xform * parent_tf
+            _pp_pos, _pp_rot = _snap_xform(parent_tf.p, parent_tf.q, normalize_quat=True)
+            parent_tf = wp.transform(_pp_pos, _pp_rot)
 
         joint_armature = R.get_value(
             joint_prim, prim_type=PrimType.JOINT, key="armature", default=default_joint_armature, verbose=verbose
@@ -1636,6 +1661,8 @@ def parse_usd(
         )
         if incoming_xform is not None:
             parent_tf = incoming_xform * parent_tf
+            _pp_pos, _pp_rot = _snap_xform(parent_tf.p, parent_tf.q, normalize_quat=True)
+            parent_tf = wp.transform(_pp_pos, _pp_rot)
 
         # Warn if any sibling joint has a different anchor position.
         # Different local rotations are expected (they encode different DOF axis directions)
