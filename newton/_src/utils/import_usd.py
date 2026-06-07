@@ -1098,22 +1098,29 @@ def parse_usd(
             return -1
 
         rot = rigid_body_desc.rotation
-        # ``eps_rot=1e-10`` snaps sub-ulp dust left by f32 transform
-        # composition (e.g. quat components at ~9e-12 from numpy@ vs pxr
-        # GfMatrix mul-add accumulation drift) so body_q bytes agree across
-        # backends. The default ``eps=1e-12`` would miss values just above
-        # 1e-12; tighter than 1e-7 to avoid perturbing the FP-amplifying mass
-        # cluster on robots like robotiq_2f85.
-        _orig_pos, _orig_rot = _snap_xform(rigid_body_desc.position, usd.value_to_warp(rot), eps_rot=1e-10)
+        # ``eps_rot=1e-7`` snaps quat residuals from f32 composition of
+        # near-axis-aligned rotations (e.g. xformOp:orient = (6.12e-17, 1, 0, 0)
+        # composed through an articulation chain leaves ~1.58e-8 dust in the
+        # would-be-zero components of the final quat). Both pxr and nano
+        # backends produce these residuals at 1-ulp-different magnitudes;
+        # snapping both to zero at the shared parse_body boundary collapses
+        # body_q hash diffs (e.g. robot_soccer_kit body[46]/[54]/[56]/[60]).
+        # Position threshold stays at 1e-12 (default) since positions don't
+        # have the same near-zero-residual pattern.
+        _orig_pos, _orig_rot = _snap_xform(rigid_body_desc.position, usd.value_to_warp(rot), eps_rot=1e-7)
         origin = wp.transform(_orig_pos, _orig_rot)
         if incoming_xform is not None:
             origin = wp.mul(incoming_xform, origin)
-            # wp.mul of two snapped transforms can leave sub-ulp residuals in
-            # the result (e.g. ~1e-17 components in a quat that should be
-            # identity), and the two backends produce slightly different
-            # residuals, surfacing as body_q hash mismatches. Re-snap so the
-            # final f32 bytes agree.
-            _orig_pos, _orig_rot = _snap_xform(origin.p, origin.q, eps_rot=1e-10)
+            # Re-snap with same eps_rot=1e-7 after composition: wp.mul of two
+            # snapped transforms can leave sub-ulp residuals (e.g. ~1e-17
+            # components in a quat that should be identity), and the two
+            # backends produce slightly different residuals. ``normalize_quat``
+            # extends iter 22's joint-pose pattern: f64 magnitude renormalize
+            # collapses backends whose composed quats have slightly different
+            # non-unit magnitudes (e.g. flybody body_q 1.49e-8 drift).
+            _orig_pos, _orig_rot = _snap_xform(
+                origin.p, origin.q, eps_rot=1e-7, normalize_quat=True
+            )
             origin = wp.transform(_orig_pos, _orig_rot)
         path = str(prim.GetPath())
 
