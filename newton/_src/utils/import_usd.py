@@ -869,6 +869,14 @@ def parse_usd(
         xform_pos, xform_rot, scale = wp.transform_decompose(rel_mat)
         xform_pos, xform_rot = _snap_xform(xform_pos, xform_rot)
         xform_rot = _canonicalize_visual_quat(xform_rot)
+        # Snap near-unit scale to exact 1.0 so that pxr/nano backends with
+        # 1-ulp-different rel_mat decompositions feed identical f32 dimensions
+        # into add_shape_* (e.g. ms_human_700 visual cylinders).
+        scale = wp.vec3(
+            1.0 if abs(scale[0] - 1.0) < 1e-6 else float(scale[0]),
+            1.0 if abs(scale[1] - 1.0) < 1e-6 else float(scale[1]),
+            1.0 if abs(scale[2] - 1.0) < 1e-6 else float(scale[2]),
+        )
         xform = wp.transform(xform_pos, xform_rot)
 
         if prim.IsInstance():
