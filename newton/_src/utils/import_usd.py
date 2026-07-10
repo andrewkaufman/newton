@@ -75,6 +75,9 @@ def _resolve_newton_limit_ke(
     fallback: float,
     fallback_source: str,
     builder_default: float,
+    mjc_provenance: str | None = None,
+    broadcast_priority: int = 0,
+    fallback_priority: int = 0,
 ) -> tuple[float, str]:
     """Resolve a NewtonJointAPI ``newton:limitStiffness`` value.
 
@@ -89,16 +92,37 @@ def _resolve_newton_limit_ke(
     the builder default so that a lower-priority schema cannot override an
     authored Newton sentinel.
 
-    Returns (resolved_value, source) where source is ``"force"`` when Newton
-    broadcast values are used, or the original ``fallback_source`` otherwise.
+    ``mjc_provenance`` is ``"authored"`` when the broadcast value came from an
+    authored MJC ``solreflimit``, ``"default"`` when from the MJC mapping default
+    (MjcJointAPI applied but solreflimit not authored), or ``None`` otherwise.
+
+    ``broadcast_priority`` / ``fallback_priority`` are 0-based resolver indices
+    (lower = higher priority). When the per-axis fallback comes from a
+    higher-priority resolver than the broadcast value, the fallback wins.
+
+    Returns (resolved_value, source) where source is one of ``"force"``,
+    ``"mjc_authored"``, or ``"mjc_default"``.
     """
+    if mjc_provenance == "authored":
+        source = "mjc_authored"
+    elif mjc_provenance == "default":
+        source = "mjc_default"
+    else:
+        source = "force"
     if limit_ke is None:
+        # When MJC solreflimit is authored but the converted value is None (unconvertible like [0,0]),
+        # preserve the authored provenance for solref mode selection.
+        if mjc_provenance == "authored":
+            return fallback, "mjc_authored"
+        return fallback, fallback_source
+    # Per-axis fallback from a higher-priority resolver beats broadcast.
+    if fallback_priority < broadcast_priority:
         return fallback, fallback_source
     if limit_ke == float("-inf"):
-        return builder_default, "force"
+        return builder_default, source
     if limit_ke == float("inf"):
-        return _HARD_LIMIT_KE, "force"
-    return limit_ke, "force"
+        return _HARD_LIMIT_KE, source
+    return limit_ke, source
 
 
 def _resolve_newton_limit_kd(
@@ -107,6 +131,11 @@ def _resolve_newton_limit_kd(
     fallback: float,
     fallback_source: str,
     builder_default: float,
+    mjc_provenance_ke: str | None = None,
+    mjc_provenance_kd: str | None = None,
+    broadcast_priority_ke: int = 0,
+    broadcast_priority_kd: int = 0,
+    fallback_priority: int = 0,
 ) -> tuple[float, str]:
     """Resolve a NewtonJointAPI ``newton:limitDamping`` value.
 
@@ -116,21 +145,44 @@ def _resolve_newton_limit_kd(
     When neither Newton attribute is authored (``None``), the per-DOF ``fallback``
     from other resolvers is used.
 
-    Returns (resolved_value, source) where source is ``"force"`` when Newton
-    broadcast values are used, or the original ``fallback_source`` otherwise.
+    ``mjc_provenance_ke``/``mjc_provenance_kd`` follow the same convention as
+    ``mjc_provenance`` in ``_resolve_newton_limit_ke``.
+
+    ``broadcast_priority_kd`` / ``fallback_priority`` control priority comparison
+    analogous to ``_resolve_newton_limit_ke``.
+
+    Returns (resolved_value, source) where source is one of ``"force"``,
+    ``"mjc_authored"``, or ``"mjc_default"``.
     """
+    if mjc_provenance_kd == "authored":
+        source_kd = "mjc_authored"
+    elif mjc_provenance_kd == "default":
+        source_kd = "mjc_default"
+    else:
+        source_kd = "force"
+    if mjc_provenance_ke == "authored":
+        source_ke = "mjc_authored"
+    elif mjc_provenance_ke == "default":
+        source_ke = "mjc_default"
+    else:
+        source_ke = "force"
     # Hard (rigid) limit: infinite ke or kd means no dissipation is needed.
     if limit_ke is not None and limit_ke == float("inf"):
-        return 0.0, "force"
+        return 0.0, source_ke
     if limit_kd is not None and limit_kd == float("inf"):
-        return 0.0, "force"
+        return 0.0, source_kd
     # Not authored → lower-priority per-DOF fallback.
     if limit_kd is None:
+        if mjc_provenance_kd == "authored":
+            return fallback, "mjc_authored"
+        return fallback, fallback_source
+    # Per-axis fallback from a higher-priority resolver beats broadcast.
+    if fallback_priority < broadcast_priority_kd:
         return fallback, fallback_source
     # Authored -inf → builder default.
     if limit_kd == float("-inf"):
-        return builder_default, "force"
-    return limit_kd, "force"
+        return builder_default, source_kd
+    return limit_kd, source_kd
 
 
 def _validate_https_usd_url(url: str) -> None:
@@ -627,21 +679,36 @@ def parse_usd(
         return mjc_resolver is not None and solreflimit_mode_key in builder.custom_attributes
 
     # Keep source tracking local until schema applicability and provenance are modeled globally (#3307).
+    # MuJoCo's default solreflimit [0.02, 1.0] is used when MjcJointAPI is applied but solreflimit
+    # is not explicitly authored. Kept here (not in mapping.default) so the resolver doesn't
+    # return a value for unrelated prims that happen to not author solreflimit.
+    _MJC_SOLREF_DEFAULT = [0.02, 1.0]
+
     def _get_mjc_joint_limit_default(prim: Usd.Prim, key: str) -> float | None:
+        # Returns MuJoCo's schema default for the requested key when MjcJointAPI is applied.
+        # Only matches keys that exist in the MJC mapping (``limit_ke``/``limit_kd``); per-axis
+        # keys like ``limit_angular_ke`` return None because MuJoCo has no per-axis differentiation
+        # and its contribution flows through the broadcast ``limit_ke``/``limit_kd`` path instead.
         if mjc_resolver is None or not _has_api_schema(prim, "MjcJointAPI"):
             return None
         spec = mjc_resolver.mapping.get(PrimType.JOINT, {}).get(key)
-        if spec is None or spec.default is None:
+        if spec is None:
             return None
+        default = spec.default if spec.default is not None else _MJC_SOLREF_DEFAULT
         if spec.usd_value_transformer is not None:
-            return spec.usd_value_transformer(spec.default)
-        return spec.default
+            return spec.usd_value_transformer(default)
+        return default
 
     def _resolve_joint_limit_gain(
         prim: Usd.Prim, key: str, builder_default: float
-    ) -> tuple[float, Literal["force", "mjc_authored", "mjc_default"]]:
-        """Resolve a limit gain and report the semantics of its source."""
-        for resolver in R.resolvers:
+    ) -> tuple[float, Literal["force", "mjc_authored", "mjc_default"], int]:
+        """Resolve a limit gain and report the semantics of its source.
+
+        Returns (value, source, resolver_priority) where resolver_priority is the
+        0-based index into R.resolvers of the resolver that supplied the value,
+        or len(R.resolvers) when no resolver matched (builder default used).
+        """
+        for idx, resolver in enumerate(R.resolvers):
             spec = resolver.mapping.get(PrimType.JOINT, {}).get(key)
             if spec is None:
                 continue
@@ -655,22 +722,23 @@ def parse_usd(
                     spec.usd_value_transformer(raw_value) if spec.usd_value_transformer is not None else raw_value
                 )
                 if authored_value is not None:
-                    return authored_value, "mjc_authored"
+                    return authored_value, "mjc_authored", idx
                 mjc_default = _get_mjc_joint_limit_default(prim, key)
                 if mjc_default is not None:
-                    return mjc_default, "mjc_authored"
-                return builder_default, "mjc_authored"
+                    return mjc_default, "mjc_authored", idx
+                return builder_default, "mjc_authored", idx
 
             authored_value = resolver.get_value(prim, PrimType.JOINT, key)
             if authored_value is not None:
                 R._collect_on_first_use(resolver, prim)
-                return authored_value, "force"
+                return authored_value, "force", idx
 
         if mjc_resolver is not None:
             mjc_default = _get_mjc_joint_limit_default(prim, key)
             if mjc_default is not None:
-                return mjc_default, "mjc_default"
-        return builder_default, "force"
+                mjc_idx = next((i for i, r in enumerate(R.resolvers) if r.name == "mjc"), len(R.resolvers))
+                return mjc_default, "mjc_default", mjc_idx
+        return builder_default, "force", len(R.resolvers)
 
     def _joint_limit_solref_mode(ke_source: str, kd_source: str) -> int:
         """Choose MuJoCo limit-solref semantics from the resolved gain sources."""
@@ -1406,8 +1474,60 @@ def parse_usd(
         # NewtonJointAPI uses +inf for "unlimited"; treat it as the builder default below.
         if joint_velocity_limit == float("inf"):
             joint_velocity_limit = None
-        limit_ke = R.get_value(joint_prim, prim_type=PrimType.JOINT, key="limit_ke", default=None, verbose=verbose)
-        limit_kd = R.get_value(joint_prim, prim_type=PrimType.JOINT, key="limit_kd", default=None, verbose=verbose)
+        limit_ke, limit_ke_resolver = R.get_value_with_resolver(
+            joint_prim, prim_type=PrimType.JOINT, key="limit_ke", default=None, verbose=verbose
+        )
+        limit_kd, limit_kd_resolver = R.get_value_with_resolver(
+            joint_prim, prim_type=PrimType.JOINT, key="limit_kd", default=None, verbose=verbose
+        )
+        # Broadcast limit resolution: MuJoCo's ``mjc:solreflimit`` is axis-agnostic, so its
+        # per-DOF contribution flows through the broadcast ``limit_ke``/``limit_kd`` keys.
+        # When MjcJointAPI is applied but ``mjc:solreflimit`` is not authored, fall back to
+        # MuJoCo's schema default [0.02, 1.0].
+        limit_ke_is_mjc_default = False
+        limit_kd_is_mjc_default = False
+        if limit_ke is None:
+            _mjc_default = _get_mjc_joint_limit_default(joint_prim, "limit_ke")
+            if _mjc_default is not None:
+                limit_ke = _mjc_default
+                limit_ke_is_mjc_default = True
+        if limit_kd is None:
+            _mjc_default = _get_mjc_joint_limit_default(joint_prim, "limit_kd")
+            if _mjc_default is not None:
+                limit_kd = _mjc_default
+                limit_kd_is_mjc_default = True
+        # Classify MJC provenance for solref mode selection and per-axis fallback priority.
+        _mjc_priority = next((i for i, r in enumerate(R.resolvers) if r.name == "mjc"), len(R.resolvers))
+        # Check if mjc:solreflimit is actually authored on the prim (needed for the case where
+        # the transformer returns None for unconvertible values like [0, 0]).
+        _mjc_solreflimit_authored = (
+            mjc_resolver is not None and usd.get_attribute(joint_prim, "mjc:solreflimit") is not None
+        )
+        if limit_ke_resolver is not None and limit_ke_resolver.name == "mjc":
+            limit_ke_is_mjc = "authored"
+            limit_ke_priority = _mjc_priority
+        elif _mjc_solreflimit_authored:
+            # Transformer returned None (unconvertible solref like [0,0]) but the attr IS authored.
+            limit_ke_is_mjc = "authored"
+            limit_ke_priority = _mjc_priority
+        elif limit_ke_is_mjc_default:
+            limit_ke_is_mjc = "default"
+            limit_ke_priority = _mjc_priority
+        else:
+            limit_ke_is_mjc = None
+            limit_ke_priority = next((i for i, r in enumerate(R.resolvers) if r is limit_ke_resolver), len(R.resolvers)) if limit_ke_resolver is not None else len(R.resolvers)
+        if limit_kd_resolver is not None and limit_kd_resolver.name == "mjc":
+            limit_kd_is_mjc = "authored"
+            limit_kd_priority = _mjc_priority
+        elif _mjc_solreflimit_authored:
+            limit_kd_is_mjc = "authored"
+            limit_kd_priority = _mjc_priority
+        elif limit_kd_is_mjc_default:
+            limit_kd_is_mjc = "default"
+            limit_kd_priority = _mjc_priority
+        else:
+            limit_kd_is_mjc = None
+            limit_kd_priority = next((i for i, r in enumerate(R.resolvers) if r is limit_kd_resolver), len(R.resolvers)) if limit_kd_resolver is not None else len(R.resolvers)
 
         # Extract custom attributes for this joint
         joint_custom_attrs = usd.get_custom_attribute_values(
@@ -1435,21 +1555,26 @@ def parse_usd(
                 limit_gains_scaling = 1.0
 
             limit_key = "limit_angular" if key == UsdPhysics.ObjectType.RevoluteJoint else "limit_linear"
-            fallback_limit_ke, limit_ke_source = _resolve_joint_limit_gain(
+            fallback_limit_ke, limit_ke_source, fallback_ke_priority = _resolve_joint_limit_gain(
                 joint_prim,
                 f"{limit_key}_ke",
                 default_joint_limit_ke * limit_gains_scaling,
             )
-            fallback_limit_kd, limit_kd_source = _resolve_joint_limit_gain(
+            fallback_limit_kd, limit_kd_source, fallback_kd_priority = _resolve_joint_limit_gain(
                 joint_prim,
                 f"{limit_key}_kd",
                 default_joint_limit_kd * limit_gains_scaling,
             )
             current_joint_limit_ke, limit_ke_source = _resolve_newton_limit_ke(
-                limit_ke, fallback_limit_ke, limit_ke_source, default_joint_limit_ke * limit_gains_scaling
+                limit_ke, fallback_limit_ke, limit_ke_source, default_joint_limit_ke * limit_gains_scaling,
+                mjc_provenance=limit_ke_is_mjc,
+                broadcast_priority=limit_ke_priority, fallback_priority=fallback_ke_priority,
             )
             current_joint_limit_kd, limit_kd_source = _resolve_newton_limit_kd(
-                limit_ke, limit_kd, fallback_limit_kd, limit_kd_source, default_joint_limit_kd * limit_gains_scaling
+                limit_ke, limit_kd, fallback_limit_kd, limit_kd_source, default_joint_limit_kd * limit_gains_scaling,
+                mjc_provenance_ke=limit_ke_is_mjc, mjc_provenance_kd=limit_kd_is_mjc,
+                broadcast_priority_ke=limit_ke_priority, broadcast_priority_kd=limit_kd_priority,
+                fallback_priority=fallback_kd_priority,
             )
             if _should_write_solreflimit_mode():
                 joint_custom_attrs[solreflimit_mode_key] = _joint_limit_solref_mode(limit_ke_source, limit_kd_source)
@@ -1512,8 +1637,11 @@ def parse_usd(
 
                 joint_params["limit_lower"] *= DegreesToRadian
                 joint_params["limit_upper"] *= DegreesToRadian
-                joint_params["limit_ke"] /= DegreesToRadian
-                joint_params["limit_kd"] /= DegreesToRadian
+                # MJC-sourced stiffness/damping are already per-radian; only convert PhysX/Newton (per-degree).
+                if limit_ke_source not in ("mjc_authored", "mjc_default"):
+                    joint_params["limit_ke"] /= DegreesToRadian
+                if limit_kd_source not in ("mjc_authored", "mjc_default"):
+                    joint_params["limit_kd"] /= DegreesToRadian
                 if joint_damping_authored:
                     joint_params["damping"] /= DegreesToRadian
                 if joint_params["velocity_limit"] is not None:
@@ -1618,21 +1746,26 @@ def parse_usd(
                         default=None,
                         verbose=verbose,
                     )
-                    fallback_limit_ke, limit_ke_source = _resolve_joint_limit_gain(
+                    fallback_limit_ke, limit_ke_source, fallback_ke_priority = _resolve_joint_limit_gain(
                         joint_prim,
-                        f"limit_{trans_name}_ke",
+                        "limit_linear_ke",
                         default_joint_limit_ke,
                     )
-                    fallback_limit_kd, limit_kd_source = _resolve_joint_limit_gain(
+                    fallback_limit_kd, limit_kd_source, fallback_kd_priority = _resolve_joint_limit_gain(
                         joint_prim,
-                        f"limit_{trans_name}_kd",
+                        "limit_linear_kd",
                         default_joint_limit_kd,
                     )
                     current_joint_limit_ke, limit_ke_source = _resolve_newton_limit_ke(
-                        limit_ke, fallback_limit_ke, limit_ke_source, default_joint_limit_ke
+                        limit_ke, fallback_limit_ke, limit_ke_source, default_joint_limit_ke,
+                        mjc_provenance=limit_ke_is_mjc,
+                        broadcast_priority=limit_ke_priority, fallback_priority=fallback_ke_priority,
                     )
                     current_joint_limit_kd, limit_kd_source = _resolve_newton_limit_kd(
-                        limit_ke, limit_kd, fallback_limit_kd, limit_kd_source, default_joint_limit_kd
+                        limit_ke, limit_kd, fallback_limit_kd, limit_kd_source, default_joint_limit_kd,
+                        mjc_provenance_ke=limit_ke_is_mjc, mjc_provenance_kd=limit_kd_is_mjc,
+                        broadcast_priority_ke=limit_ke_priority, broadcast_priority_kd=limit_kd_priority,
+                        fallback_priority=fallback_kd_priority,
                     )
                     linear_axes.append(
                         ModelBuilder.JointDofConfig(
@@ -1676,12 +1809,12 @@ def parse_usd(
                         default=None,
                         verbose=verbose,
                     )
-                    fallback_limit_ke, limit_ke_source = _resolve_joint_limit_gain(
+                    fallback_limit_ke, limit_ke_source, fallback_ke_priority = _resolve_joint_limit_gain(
                         joint_prim,
                         f"limit_{rot_name}_ke",
                         default_joint_limit_ke * DegreesToRadian,
                     )
-                    fallback_limit_kd, limit_kd_source = _resolve_joint_limit_gain(
+                    fallback_limit_kd, limit_kd_source, fallback_kd_priority = _resolve_joint_limit_gain(
                         joint_prim,
                         f"limit_{rot_name}_kd",
                         default_joint_limit_kd * DegreesToRadian,
@@ -1691,6 +1824,8 @@ def parse_usd(
                         fallback_limit_ke,
                         limit_ke_source,
                         default_joint_limit_ke * DegreesToRadian,
+                        mjc_provenance=limit_ke_is_mjc,
+                        broadcast_priority=limit_ke_priority, fallback_priority=fallback_ke_priority,
                     )
                     current_joint_limit_kd, limit_kd_source = _resolve_newton_limit_kd(
                         limit_ke,
@@ -1698,6 +1833,10 @@ def parse_usd(
                         fallback_limit_kd,
                         limit_kd_source,
                         default_joint_limit_kd * DegreesToRadian,
+                        mjc_provenance_ke=limit_ke_is_mjc,
+                        mjc_provenance_kd=limit_kd_is_mjc,
+                        broadcast_priority_ke=limit_ke_priority, broadcast_priority_kd=limit_kd_priority,
+                        fallback_priority=fallback_kd_priority,
                     )
 
                     angular_axes.append(
@@ -1705,8 +1844,8 @@ def parse_usd(
                             axis=_rot_axes[dof],
                             limit_lower=limit_lower * DegreesToRadian,
                             limit_upper=limit_upper * DegreesToRadian,
-                            limit_ke=current_joint_limit_ke / DegreesToRadian,
-                            limit_kd=current_joint_limit_kd / DegreesToRadian,
+                            limit_ke=current_joint_limit_ke if limit_ke_source in ("mjc_authored", "mjc_default") else current_joint_limit_ke / DegreesToRadian,
+                            limit_kd=current_joint_limit_kd if limit_kd_source in ("mjc_authored", "mjc_default") else current_joint_limit_kd / DegreesToRadian,
                             target_pos=target_pos * DegreesToRadian,
                             target_vel=target_vel * DegreesToRadian,
                             target_ke=target_ke / DegreesToRadian / joint_drive_gains_scaling,
@@ -1939,18 +2078,49 @@ def parse_usd(
                 j_velocity_limit = None
 
             limit_key = "limit_angular" if is_revolute else "limit_linear"
-            j_newton_limit_ke = R.get_value(
+            j_newton_limit_ke, j_limit_ke_resolver = R.get_value_with_resolver(
                 jp_prim, prim_type=PrimType.JOINT, key="limit_ke", default=None, verbose=verbose
             )
-            j_newton_limit_kd = R.get_value(
+            j_newton_limit_kd, j_limit_kd_resolver = R.get_value_with_resolver(
                 jp_prim, prim_type=PrimType.JOINT, key="limit_kd", default=None, verbose=verbose
             )
-            fallback_limit_ke, limit_ke_source = _resolve_joint_limit_gain(
+            # Fall back to MuJoCo's schema default when MjcJointAPI is applied but solreflimit isn't authored.
+            j_limit_ke_is_mjc_default = False
+            j_limit_kd_is_mjc_default = False
+            if j_newton_limit_ke is None:
+                _mjc_default = _get_mjc_joint_limit_default(jp_prim, "limit_ke")
+                if _mjc_default is not None:
+                    j_newton_limit_ke = _mjc_default
+                    j_limit_ke_is_mjc_default = True
+            if j_newton_limit_kd is None:
+                _mjc_default = _get_mjc_joint_limit_default(jp_prim, "limit_kd")
+                if _mjc_default is not None:
+                    j_newton_limit_kd = _mjc_default
+                    j_limit_kd_is_mjc_default = True
+            if j_limit_ke_resolver is not None and j_limit_ke_resolver.name == "mjc":
+                j_limit_ke_is_mjc = "authored"
+                j_limit_ke_priority = _mjc_priority
+            elif j_limit_ke_is_mjc_default:
+                j_limit_ke_is_mjc = "default"
+                j_limit_ke_priority = _mjc_priority
+            else:
+                j_limit_ke_is_mjc = None
+                j_limit_ke_priority = next((i for i, r in enumerate(R.resolvers) if r is j_limit_ke_resolver), len(R.resolvers)) if j_limit_ke_resolver is not None else len(R.resolvers)
+            if j_limit_kd_resolver is not None and j_limit_kd_resolver.name == "mjc":
+                j_limit_kd_is_mjc = "authored"
+                j_limit_kd_priority = _mjc_priority
+            elif j_limit_kd_is_mjc_default:
+                j_limit_kd_is_mjc = "default"
+                j_limit_kd_priority = _mjc_priority
+            else:
+                j_limit_kd_is_mjc = None
+                j_limit_kd_priority = next((i for i, r in enumerate(R.resolvers) if r is j_limit_kd_resolver), len(R.resolvers)) if j_limit_kd_resolver is not None else len(R.resolvers)
+            fallback_limit_ke, limit_ke_source, fallback_ke_priority = _resolve_joint_limit_gain(
                 jp_prim,
                 f"{limit_key}_ke",
                 default_joint_limit_ke * limit_gains_scaling,
             )
-            fallback_limit_kd, limit_kd_source = _resolve_joint_limit_gain(
+            fallback_limit_kd, limit_kd_source, fallback_kd_priority = _resolve_joint_limit_gain(
                 jp_prim,
                 f"{limit_key}_kd",
                 default_joint_limit_kd * limit_gains_scaling,
@@ -1960,6 +2130,8 @@ def parse_usd(
                 fallback_limit_ke,
                 limit_ke_source,
                 default_joint_limit_ke * limit_gains_scaling,
+                mjc_provenance=j_limit_ke_is_mjc,
+                broadcast_priority=j_limit_ke_priority, fallback_priority=fallback_ke_priority,
             )
             limit_kd, limit_kd_source = _resolve_newton_limit_kd(
                 j_newton_limit_ke,
@@ -1967,6 +2139,10 @@ def parse_usd(
                 fallback_limit_kd,
                 limit_kd_source,
                 default_joint_limit_kd * limit_gains_scaling,
+                mjc_provenance_ke=j_limit_ke_is_mjc,
+                mjc_provenance_kd=j_limit_kd_is_mjc,
+                broadcast_priority_ke=j_limit_ke_priority, broadcast_priority_kd=j_limit_kd_priority,
+                fallback_priority=fallback_kd_priority,
             )
 
             limit_lower = jd.limit.lower
@@ -2011,8 +2187,11 @@ def parse_usd(
             if is_revolute:
                 limit_lower *= DegreesToRadian
                 limit_upper *= DegreesToRadian
-                limit_ke /= DegreesToRadian
-                limit_kd /= DegreesToRadian
+                # MJC-sourced stiffness/damping are already per-radian; only convert PhysX/Newton (per-degree).
+                if limit_ke_source not in ("mjc_authored", "mjc_default"):
+                    limit_ke /= DegreesToRadian
+                if limit_kd_source not in ("mjc_authored", "mjc_default"):
+                    limit_kd /= DegreesToRadian
                 if j_damping_authored:
                     j_damping /= DegreesToRadian
                 if jd.drive.enabled:
