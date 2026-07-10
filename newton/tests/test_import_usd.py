@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import hashlib
 import math
 import os
+import posixpath
 import tempfile
 import unittest
 import warnings
 from unittest import mock
+from urllib.parse import urlparse
 
 import numpy as np
 import warp as wp
@@ -8380,6 +8383,55 @@ class TestImportSampleAssetsComposition(unittest.TestCase):
         self.assertAlmostEqual(item_values[1], default_value, places=5)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_custom_frequency_honors_ignore_paths(self):
+        """Test that custom frequency parsing skips prims matching ignore_paths.
+
+        Regression test: every other traversal in parse_usd honors ignore_paths,
+        but the custom-frequency traversal visited ignored subtrees and registered
+        spurious rows for prims that were excluded from the import.
+        """
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        # Two matching prims in the kept subtree, two more under an ignored subtree.
+        UsdGeom.Xform.Define(stage, "/World/RobotA/CustomItem0")
+        UsdGeom.Xform.Define(stage, "/World/RobotA/CustomItem1")
+        UsdGeom.Xform.Define(stage, "/World/envs/env_0/CustomItem0")
+        UsdGeom.Xform.Define(stage, "/World/envs/env_1/CustomItem0")
+
+        def is_custom_item(prim, context):
+            return prim.GetName().startswith("CustomItem")
+
+        builder = newton.ModelBuilder()
+        builder.add_custom_frequency(
+            newton.ModelBuilder.CustomFrequency(
+                name="item",
+                namespace="test",
+                usd_prim_filter=is_custom_item,
+            )
+        )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="item_value",
+                frequency="test:item",
+                dtype=wp.float32,
+                default=42.0,
+                namespace="test",
+            )
+        )
+
+        builder.add_usd(stage, ignore_paths=["/World/envs"])
+
+        model = builder.finalize()
+
+        # Only the two prims outside the ignored subtree may contribute rows.
+        self.assertEqual(model.get_custom_frequency_count("test:item"), 2)
+        self.assertEqual(len(model.test.item_value.numpy()), 2)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_custom_frequency_instance_proxy_traversal(self):
         """Test that custom frequency parsing traverses instance proxy prims.
 
@@ -11161,7 +11213,7 @@ def Mesh "JustAMesh" ()
 
         stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_with_material.usda"))
         prim = stage.GetPrimAtPath("/World/SoftBody")
-        tm = usd.get_tetmesh(prim)
+        tm = usd.get_tetmesh(prim, compat_namespaces=())
 
         # E = 300000, nu = 0.3
         # k_mu = E / (2 * (1 + nu)) = 300000 / 2.6 = 115384.615...
@@ -11171,6 +11223,114 @@ def Mesh "JustAMesh" ()
         self.assertAlmostEqual(tm.k_mu[0], 300000.0 / (2.0 * 1.3), places=0)
         self.assertAlmostEqual(tm.k_lambda[0], 300000.0 * 0.3 / (1.3 * 0.4), places=0)
         self.assertAlmostEqual(tm.density, 40.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_vendor_namespace_legacy_recovery(self):
+        """Vendor-namespaced material reads follow the ``compat_namespaces`` opt-in.
+
+        Canonical-only (``compat_namespaces=()``) reads moduli only from a ``physics:`` material
+        that applies ``PhysicsVolumeDeformableMaterialAPI``. The deprecated default (``None``) reads
+        vendor namespaces off any bound material and emits a ``DeprecationWarning``;
+        ``DEFORMABLE_LEGACY_NAMESPACES`` keeps that behavior explicitly (without the warning).
+        """
+        from pxr import Usd
+
+        # Legacy-style asset: a vendor-namespaced material with no PhysicsVolumeDeformableMaterialAPI.
+        usda = """#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+def Xform "World" ()
+{
+    def TetMesh "SoftBody" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+        int4[] tetVertexIndices = [(0, 1, 2, 3)]
+        rel material:binding:physics = </World/PhysicsMaterial>
+    }
+    def Material "PhysicsMaterial"
+    {
+        float omniphysics:density = 40
+        float omniphysics:youngsModulus = 300000
+        float omniphysics:poissonsRatio = 0.3
+    }
+    def TetMesh "CanonicalBody" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+        int4[] tetVertexIndices = [(0, 1, 2, 3)]
+        rel material:binding:physics = </World/CanonicalMaterial>
+    }
+    def Material "CanonicalMaterial" (
+        prepend apiSchemas = ["PhysicsVolumeDeformableMaterialAPI"]
+    )
+    {
+        custom float physics:density = 40
+        custom float physics:youngsModulus = 300000
+        custom float physics:poissonsRatio = 0.3
+    }
+    def TetMesh "UnscopedBody" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+        int4[] tetVertexIndices = [(0, 1, 2, 3)]
+        rel material:binding:physics = </World/UnscopedMaterial>
+    }
+    def Material "UnscopedMaterial"
+    {
+        custom float physics:density = 40
+        custom float physics:youngsModulus = 300000
+        custom float physics:poissonsRatio = 0.3
+    }
+}
+"""
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(usda)
+        prim = stage.GetPrimAtPath("/World/SoftBody")
+
+        # Canonical-only: vendor moduli are ignored.
+        tm_canonical = usd.get_tetmesh(prim, compat_namespaces=())
+        self.assertIsNone(tm_canonical.k_mu)
+        self.assertIsNone(tm_canonical.density)
+
+        # Deprecated default: reads the vendor namespaces off the bound material and warns.
+        with self.assertWarns(DeprecationWarning):
+            tm_default = usd.get_tetmesh(prim)
+        self.assertIsNotNone(tm_default.k_mu)
+        self.assertAlmostEqual(tm_default.density, 40.0)
+
+        # Explicit legacy namespaces: same reads, no deprecation warning.
+        tm_legacy = usd.get_tetmesh(prim, compat_namespaces=usd.DEFORMABLE_LEGACY_NAMESPACES)
+        self.assertIsNotNone(tm_legacy.k_mu)
+        self.assertAlmostEqual(tm_legacy.k_mu[0], 300000.0 / (2.0 * 1.3), places=0)
+        self.assertAlmostEqual(tm_legacy.density, 40.0)
+
+        # A canonical material under the deprecated default reads identically and must NOT
+        # warn: the default change alters nothing for it (the gate matches add_usd's).
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            tm_canonical_default = usd.get_tetmesh(stage.GetPrimAtPath("/World/CanonicalBody"))
+        self.assertAlmostEqual(tm_canonical_default.density, 40.0)
+        self.assertIsNotNone(tm_canonical_default.k_mu)
+
+        # Canonical physics: moduli on a material WITHOUT the deformable material API: the
+        # deprecated default reads them off any bound material, but canonical-only scopes
+        # moduli to API-applied materials and drops them. The default is load-bearing, so
+        # it must warn.
+        unscoped = stage.GetPrimAtPath("/World/UnscopedBody")
+        with self.assertWarns(DeprecationWarning):
+            tm_unscoped_default = usd.get_tetmesh(unscoped)
+        self.assertIsNotNone(tm_unscoped_default.k_mu)
+        self.assertAlmostEqual(tm_unscoped_default.density, 40.0)
+        tm_unscoped_canonical = usd.get_tetmesh(unscoped, compat_namespaces=())
+        self.assertIsNone(tm_unscoped_canonical.k_mu)
+        self.assertIsNone(tm_unscoped_canonical.density)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_get_tetmesh_no_material(self):
@@ -11184,6 +11344,27 @@ def Mesh "JustAMesh" ()
         self.assertIsNone(tm.k_mu)
         self.assertIsNone(tm.k_lambda)
         self.assertIsNone(tm.density)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_warns_on_geometry_authored_moduli(self):
+        """A material modulus authored on the TetMesh geometry instead of the bound material warns,
+        pointing to the deformable material API, instead of being dropped silently."""
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def TetMesh "Soft" ()
+{
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    int4[] tetVertexIndices = [(0, 1, 2, 3)]
+    custom float physics:youngsModulus = 300000
+}
+"""
+        )
+        prim = stage.GetPrimAtPath("/Soft")
+        with self.assertWarnsRegex(UserWarning, "authored on the geometry"):
+            usd.get_tetmesh(prim, compat_namespaces=())
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_add_usd_imports_tetmesh(self):
@@ -11211,8 +11392,10 @@ def Mesh "JustAMesh" ()
         world = UsdGeom.Xform.Define(stage, "/World")
         stage.SetDefaultPrim(world.GetPrim())
 
-        UsdGeom.Xform.Define(stage, "/Prototypes/TetProto")
-        tetmesh = stage.DefinePrim("/Prototypes/TetProto/SoftBody", "TetMesh")
+        # Author the template as a class prim (abstract, excluded by the default
+        # traversal predicate) so only the per-instance proxies are imported.
+        stage.CreateClassPrim("/TetProto")
+        tetmesh = stage.DefinePrim("/TetProto/SoftBody", "TetMesh")
         tetmesh.CreateAttribute("points", Sdf.ValueTypeNames.Point3fArray).Set(
             [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
         )
@@ -11221,7 +11404,7 @@ def Mesh "JustAMesh" ()
         for i in range(2):
             instance = UsdGeom.Xform.Define(stage, f"/World/Instance{i}")
             instance_prim = instance.GetPrim()
-            instance_prim.GetReferences().AddInternalReference("/Prototypes/TetProto")
+            instance_prim.GetReferences().AddInternalReference("/TetProto")
             instance_prim.SetInstanceable(True)
 
         builder = newton.ModelBuilder()
@@ -11752,6 +11935,14 @@ def Xform "World"
 class TestResolveUsdFromUrl(unittest.TestCase):
     """Tests for recursive USD reference resolution in :func:`resolve_usd_from_url`."""
 
+    @staticmethod
+    def _cache_path_for_absolute_reference(url: str) -> str:
+        """Return the expected safe cache-relative path for an absolute URL."""
+        parsed = urlparse(url)
+        basename = posixpath.basename(parsed.path) or "reference.usd"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+        return posixpath.join("_external_usd", digest, basename)
+
     def _run_resolve(self, url_to_layer, base_url="https://example.com/assets/scene.usd"):
         """Run resolve_usd_from_url with mocked network and USD stage I/O.
 
@@ -11767,7 +11958,14 @@ class TestResolveUsdFromUrl(unittest.TestCase):
         def fake_get(url, **_kwargs):
             downloaded_urls.append(url)
             resp = mock.MagicMock()
+            resp.url = url
+            resp.headers = {}
             layer = url_to_layer.get(url)
+            if isinstance(layer, tuple) and layer[0] == "redirect":
+                resp.status_code = 302
+                resp.headers = {"Location": layer[1]}
+                resp.content = b""
+                return resp
             if layer is None:
                 resp.status_code = 404
                 return resp
@@ -11782,9 +11980,12 @@ class TestResolveUsdFromUrl(unittest.TestCase):
         # Precompute exact local-key -> layer mapping from URLs.
         base_url_dir = base_url.rsplit("/", 1)[0]
         local_key_to_layer = {}
+
         for url, layer in url_to_layer.items():
-            if url.startswith(base_url_dir + "/"):
+            if isinstance(layer, str) and url.startswith(base_url_dir + "/"):
                 local_key_to_layer[url[len(base_url_dir) + 1 :]] = layer
+            if isinstance(layer, str) and url.startswith("https://"):
+                local_key_to_layer[self._cache_path_for_absolute_reference(url)] = layer
 
         def _local_key(path):
             return os.path.relpath(path, tmpdir).replace(os.sep, "/")
@@ -11916,6 +12117,56 @@ class TestResolveUsdFromUrl(unittest.TestCase):
         self.assertEqual(len(escaped_urls), 0)
         self.assertFalse(os.path.exists(os.path.join(tmpdir, "..", "secret.usd")))
 
+    def test_cleartext_top_level_url_rejected(self):
+        """Top-level USD downloads must use HTTPS."""
+        with self.assertRaisesRegex(ValueError, "USD URL downloads require HTTPS"):
+            self._run_resolve({}, base_url="http://example.com/assets/scene.usd")
+
+    def test_cleartext_reference_url_rejected(self):
+        """Absolute HTTP references are rejected before download."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @http://example.com/assets/child.usd@",
+        }
+        with self.assertRaisesRegex(ValueError, "USD URL downloads require HTTPS"):
+            self._run_resolve(url_to_layer)
+
+    def test_absolute_https_reference_cached_safely(self):
+        """Absolute HTTPS references are cached under a relative path."""
+        child_url = "https://cdn.example.com/assets/child.usd"
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": f"references = @{child_url}@",
+            child_url: "",
+        }
+        result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        local_ref = self._cache_path_for_absolute_reference(child_url)
+
+        self.assertIn(child_url, downloaded_urls)
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, local_ref)))
+        with open(result) as f:
+            rewritten_layer = f.read()
+        self.assertIn(f"@{local_ref}@", rewritten_layer)
+        self.assertNotIn(child_url, rewritten_layer)
+
+    def test_cleartext_redirect_url_rejected(self):
+        """Redirects to HTTP targets are rejected before following them."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": ("redirect", "http://example.com/assets/scene.usd"),
+        }
+        with self.assertRaisesRegex(ValueError, "USD URL downloads require HTTPS"):
+            self._run_resolve(url_to_layer)
+
+    def test_https_redirect_url_followed(self):
+        """Redirects to HTTPS targets are followed."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": ("redirect", "https://cdn.example.com/assets/scene.usd"),
+            "https://cdn.example.com/assets/scene.usd": "",
+        }
+        _result, _tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        self.assertEqual(
+            downloaded_urls,
+            ["https://example.com/assets/scene.usd", "https://cdn.example.com/assets/scene.usd"],
+        )
+
 
 class TestUsdMaterialColorSpaces(unittest.TestCase):
     def test_texture_color_space_auto_uses_file_attribute_fallback(self):
@@ -11962,6 +12213,125 @@ class TestUsdMaterialColorSpaces(unittest.TestCase):
         np.testing.assert_allclose(
             material_props["color"],
             newton.utils.color_linear_to_srgb(linear_color),
+            atol=1e-6,
+        )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_ancestor_binding_overrides_unapplied_mesh_binding(self):
+        """An ancestor bind with strongerThanDescendants wins over a mesh's own binding.
+
+        Many assets author ``material:binding`` on meshes without applying MaterialBindingAPI;
+        resolution must still honor a stronger ancestor override (e.g. domain-randomization
+        material rebinding on the asset root).
+        """
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        root = UsdGeom.Xform.Define(stage, "/World/Visuals")
+        mesh = UsdGeom.Mesh.Define(stage, "/World/Visuals/Mesh")
+        mesh.GetPointsAttr().Set([Gf.Vec3f(0, 0, 0), Gf.Vec3f(1, 0, 0), Gf.Vec3f(0, 1, 0)])
+        mesh.GetFaceVertexCountsAttr().Set([3])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2])
+
+        def define_material(path: str, color: tuple[float, float, float]) -> UsdShade.Material:
+            material = UsdShade.Material.Define(stage, path)
+            shader = UsdShade.Shader.Define(stage, f"{path}/PreviewSurface")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            return material
+
+        original = define_material("/World/Looks/Original", (1.0, 0.0, 0.0))
+        override = define_material("/World/Looks/Override", (0.0, 1.0, 0.0))
+
+        # mesh's own binding: a bare relationship, MaterialBindingAPI deliberately NOT applied
+        mesh.GetPrim().CreateRelationship("material:binding").SetTargets([original.GetPrim().GetPath()])
+        # ancestor override with descendant-winning strength
+        ancestor_binding = UsdShade.MaterialBindingAPI.Apply(root.GetPrim())
+        ancestor_binding.Bind(override, bindingStrength=UsdShade.Tokens.strongerThanDescendants)
+
+        from newton._src.usd.utils import resolve_material_properties_for_prim  # noqa: PLC0415
+
+        material_props = resolve_material_properties_for_prim(mesh.GetPrim())
+
+        np.testing.assert_allclose(
+            material_props["color"],
+            newton.utils.color_linear_to_srgb((0.0, 1.0, 0.0)),
+            atol=1e-6,
+        )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_ancestor_binding_overrides_applied_mesh_binding_across_depth(self):
+        """A grandparent strongerThanDescendants bind wins over a mesh's properly applied binding."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        grandparent = UsdGeom.Xform.Define(stage, "/World/Robot")
+        UsdGeom.Xform.Define(stage, "/World/Robot/link")
+        mesh = UsdGeom.Mesh.Define(stage, "/World/Robot/link/Mesh")
+        mesh.GetPointsAttr().Set([Gf.Vec3f(0, 0, 0), Gf.Vec3f(1, 0, 0), Gf.Vec3f(0, 1, 0)])
+        mesh.GetFaceVertexCountsAttr().Set([3])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2])
+
+        def define_material(path: str, color: tuple[float, float, float]) -> UsdShade.Material:
+            material = UsdShade.Material.Define(stage, path)
+            shader = UsdShade.Shader.Define(stage, f"{path}/PreviewSurface")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            return material
+
+        original = define_material("/World/Looks/Original", (1.0, 0.0, 0.0))
+        override = define_material("/World/Looks/Override", (0.0, 1.0, 0.0))
+
+        # mesh's own binding: MaterialBindingAPI properly applied this time
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(original)
+        # override two levels up, exercising resolution beyond the immediate parent
+        UsdShade.MaterialBindingAPI.Apply(grandparent.GetPrim()).Bind(
+            override, bindingStrength=UsdShade.Tokens.strongerThanDescendants
+        )
+
+        from newton._src.usd.utils import resolve_material_properties_for_prim  # noqa: PLC0415
+
+        material_props = resolve_material_properties_for_prim(mesh.GetPrim())
+
+        np.testing.assert_allclose(
+            material_props["color"],
+            newton.utils.color_linear_to_srgb((0.0, 1.0, 0.0)),
+            atol=1e-6,
+        )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_collection_based_ancestor_binding_resolves(self):
+        """Collection-based ancestor rebinds resolve through canonical ComputeBoundMaterial."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        root = UsdGeom.Xform.Define(stage, "/World/Robot")
+        mesh = UsdGeom.Mesh.Define(stage, "/World/Robot/Mesh")
+        mesh.GetPointsAttr().Set([Gf.Vec3f(0, 0, 0), Gf.Vec3f(1, 0, 0), Gf.Vec3f(0, 1, 0)])
+        mesh.GetFaceVertexCountsAttr().Set([3])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2])
+
+        material = UsdShade.Material.Define(stage, "/World/Looks/CollectionBound")
+        shader = UsdShade.Shader.Define(stage, "/World/Looks/CollectionBound/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 1.0))
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+        collection = Usd.CollectionAPI.Apply(root.GetPrim(), "blueParts")
+        collection.CreateIncludesRel().AddTarget(mesh.GetPrim().GetPath())
+        UsdShade.MaterialBindingAPI.Apply(root.GetPrim()).Bind(
+            collection, material, "blueParts", bindingStrength=UsdShade.Tokens.strongerThanDescendants
+        )
+
+        from newton._src.usd.utils import resolve_material_properties_for_prim  # noqa: PLC0415
+
+        material_props = resolve_material_properties_for_prim(mesh.GetPrim())
+
+        np.testing.assert_allclose(
+            material_props["color"],
+            newton.utils.color_linear_to_srgb((0.0, 0.0, 1.0)),
             atol=1e-6,
         )
 
