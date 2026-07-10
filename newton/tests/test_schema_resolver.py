@@ -1928,8 +1928,9 @@ class TestSchemaResolver(unittest.TestCase):
         self.assertAlmostEqual(SchemaResolverManager([M, N, P]).get_value(joint, PrimType.JOINT, "friction"), 0.3)
         self.assertAlmostEqual(SchemaResolverManager([M, P, N]).get_value(joint, PrimType.JOINT, "friction"), 0.3)
 
-        # --- Newton-only keys (damping, limit_ke, limit_kd): PhysX/MuJoCo have no mapping,
-        #     so Newton wins in every ordering when its values are authored ---
+        # --- damping: PhysX/MuJoCo have no mapping. limit_ke/limit_kd: only Newton has an
+        #     authored source here (MuJoCo maps them to mjc:solreflimit but it is not authored
+        #     on this joint), so Newton wins in every ordering ---
         for rm in [
             SchemaResolverManager([N, P, M]),
             SchemaResolverManager([N, M, P]),

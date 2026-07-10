@@ -684,21 +684,14 @@ def parse_usd(
     # return a value for unrelated prims that happen to not author solreflimit.
     _MJC_SOLREF_DEFAULT = [0.02, 1.0]
 
-    # Mapping from per-axis limit keys to the broadcast MJC key (since MJC is axis-agnostic).
-    _MJC_LIMIT_BROADCAST_KEY: dict[str, str] = {}
-    for _axis in ("linear", "angular", "rotX", "rotY", "rotZ", "transX", "transY", "transZ"):
-        _MJC_LIMIT_BROADCAST_KEY[f"limit_{_axis}_ke"] = "limit_ke"
-        _MJC_LIMIT_BROADCAST_KEY[f"limit_{_axis}_kd"] = "limit_kd"
-
     def _get_mjc_joint_limit_default(prim: Usd.Prim, key: str) -> float | None:
+        # Returns MuJoCo's schema default for the requested key when MjcJointAPI is applied.
+        # Only matches keys that exist in the MJC mapping (``limit_ke``/``limit_kd``); per-axis
+        # keys like ``limit_angular_ke`` return None because MuJoCo has no per-axis differentiation
+        # and its contribution flows through the broadcast ``limit_ke``/``limit_kd`` path instead.
         if mjc_resolver is None or not _has_api_schema(prim, "MjcJointAPI"):
             return None
-        # Look up the key directly, or fall back to the broadcast key.
         spec = mjc_resolver.mapping.get(PrimType.JOINT, {}).get(key)
-        if spec is None:
-            broadcast_key = _MJC_LIMIT_BROADCAST_KEY.get(key)
-            if broadcast_key is not None:
-                spec = mjc_resolver.mapping.get(PrimType.JOINT, {}).get(broadcast_key)
         if spec is None:
             return None
         default = spec.default if spec.default is not None else _MJC_SOLREF_DEFAULT
@@ -1487,11 +1480,23 @@ def parse_usd(
         limit_kd, limit_kd_resolver = R.get_value_with_resolver(
             joint_prim, prim_type=PrimType.JOINT, key="limit_kd", default=None, verbose=verbose
         )
-        # Track whether broadcast limit values came from an MJC resolver for solref mode selection.
-        # When get_value_with_resolver returns a resolver, it authored the value.
-        # When resolver is None but the value is not None, it came from a mapping default;
-        # check if MjcJointAPI is applied to detect MJC-default provenance.
-        # Also record the resolver's priority index for comparison with per-axis fallback.
+        # Broadcast limit resolution: MuJoCo's ``mjc:solreflimit`` is axis-agnostic, so its
+        # per-DOF contribution flows through the broadcast ``limit_ke``/``limit_kd`` keys.
+        # When MjcJointAPI is applied but ``mjc:solreflimit`` is not authored, fall back to
+        # MuJoCo's schema default [0.02, 1.0].
+        limit_ke_is_mjc_default = False
+        limit_kd_is_mjc_default = False
+        if limit_ke is None:
+            _mjc_default = _get_mjc_joint_limit_default(joint_prim, "limit_ke")
+            if _mjc_default is not None:
+                limit_ke = _mjc_default
+                limit_ke_is_mjc_default = True
+        if limit_kd is None:
+            _mjc_default = _get_mjc_joint_limit_default(joint_prim, "limit_kd")
+            if _mjc_default is not None:
+                limit_kd = _mjc_default
+                limit_kd_is_mjc_default = True
+        # Classify MJC provenance for solref mode selection and per-axis fallback priority.
         _mjc_priority = next((i for i, r in enumerate(R.resolvers) if r.name == "mjc"), len(R.resolvers))
         # Check if mjc:solreflimit is actually authored on the prim (needed for the case where
         # the transformer returns None for unconvertible values like [0, 0]).
@@ -1505,7 +1510,7 @@ def parse_usd(
             # Transformer returned None (unconvertible solref like [0,0]) but the attr IS authored.
             limit_ke_is_mjc = "authored"
             limit_ke_priority = _mjc_priority
-        elif limit_ke_resolver is None and limit_ke is not None and _has_api_schema(joint_prim, "MjcJointAPI"):
+        elif limit_ke_is_mjc_default:
             limit_ke_is_mjc = "default"
             limit_ke_priority = _mjc_priority
         else:
@@ -1517,7 +1522,7 @@ def parse_usd(
         elif _mjc_solreflimit_authored:
             limit_kd_is_mjc = "authored"
             limit_kd_priority = _mjc_priority
-        elif limit_kd_resolver is None and limit_kd is not None and _has_api_schema(joint_prim, "MjcJointAPI"):
+        elif limit_kd_is_mjc_default:
             limit_kd_is_mjc = "default"
             limit_kd_priority = _mjc_priority
         else:
@@ -2079,10 +2084,23 @@ def parse_usd(
             j_newton_limit_kd, j_limit_kd_resolver = R.get_value_with_resolver(
                 jp_prim, prim_type=PrimType.JOINT, key="limit_kd", default=None, verbose=verbose
             )
+            # Fall back to MuJoCo's schema default when MjcJointAPI is applied but solreflimit isn't authored.
+            j_limit_ke_is_mjc_default = False
+            j_limit_kd_is_mjc_default = False
+            if j_newton_limit_ke is None:
+                _mjc_default = _get_mjc_joint_limit_default(jp_prim, "limit_ke")
+                if _mjc_default is not None:
+                    j_newton_limit_ke = _mjc_default
+                    j_limit_ke_is_mjc_default = True
+            if j_newton_limit_kd is None:
+                _mjc_default = _get_mjc_joint_limit_default(jp_prim, "limit_kd")
+                if _mjc_default is not None:
+                    j_newton_limit_kd = _mjc_default
+                    j_limit_kd_is_mjc_default = True
             if j_limit_ke_resolver is not None and j_limit_ke_resolver.name == "mjc":
                 j_limit_ke_is_mjc = "authored"
                 j_limit_ke_priority = _mjc_priority
-            elif j_limit_ke_resolver is None and j_newton_limit_ke is not None and _has_api_schema(jp_prim, "MjcJointAPI"):
+            elif j_limit_ke_is_mjc_default:
                 j_limit_ke_is_mjc = "default"
                 j_limit_ke_priority = _mjc_priority
             else:
@@ -2091,7 +2109,7 @@ def parse_usd(
             if j_limit_kd_resolver is not None and j_limit_kd_resolver.name == "mjc":
                 j_limit_kd_is_mjc = "authored"
                 j_limit_kd_priority = _mjc_priority
-            elif j_limit_kd_resolver is None and j_newton_limit_kd is not None and _has_api_schema(jp_prim, "MjcJointAPI"):
+            elif j_limit_kd_is_mjc_default:
                 j_limit_kd_is_mjc = "default"
                 j_limit_kd_priority = _mjc_priority
             else:

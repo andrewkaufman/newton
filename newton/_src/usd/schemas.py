@@ -345,7 +345,9 @@ class SchemaResolverPhysx(SchemaResolver):
         PrimType.JOINT: {
             "armature": SchemaAttribute("physxJoint:armature", 0.0),
             "velocity_limit": SchemaAttribute("physxJoint:maxJointVelocity", None),
-            # PhysX has genuine per-axis variance for rotational limits
+            # PhysX authors distinct USD attributes per axis (physxLimit:linear:*, physxLimit:angular:*,
+            # physxLimit:rotX:*, ...), so unlike MuJoCo (whose mjc:solreflimit is axis-agnostic) each
+            # per-axis key here maps to its own USD attribute rather than a broadcast source.
             "limit_linear_ke": SchemaAttribute("physxLimit:linear:stiffness", 0.0),
             "limit_angular_ke": SchemaAttribute("physxLimit:angular:stiffness", 0.0),
             "limit_rotX_ke": SchemaAttribute("physxLimit:rotX:stiffness", 0.0),
